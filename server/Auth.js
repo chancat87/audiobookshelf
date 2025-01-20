@@ -1,7 +1,9 @@
 const axios = require('axios')
 const passport = require('passport')
+const { Request, Response, NextFunction } = require('express')
 const bcrypt = require('./libs/bcryptjs')
 const jwt = require('./libs/jsonwebtoken')
+const requestIp = require('./libs/requestIp')
 const LocalStrategy = require('./libs/passportLocal')
 const JwtStrategy = require('passport-jwt').Strategy
 const ExtractJwt = require('passport-jwt').ExtractJwt
@@ -13,10 +15,29 @@ const Logger = require('./Logger')
  * @class Class for handling all the authentication related functionality.
  */
 class Auth {
-
   constructor() {
     // Map of openId sessions indexed by oauth2 state-variable
     this.openIdAuthSession = new Map()
+    this.ignorePatterns = [/\/api\/items\/[^/]+\/cover/, /\/api\/authors\/[^/]+\/image/]
+  }
+
+  /**
+   * Checks if the request should not be authenticated.
+   * @param {Request} req
+   * @returns {boolean}
+   * @private
+   */
+  authNotNeeded(req) {
+    return req.method === 'GET' && this.ignorePatterns.some((pattern) => pattern.test(req.originalUrl))
+  }
+
+  ifAuthNeeded(middleware) {
+    return (req, res, next) => {
+      if (this.authNotNeeded(req)) {
+        return next()
+      }
+      middleware(req, res, next)
+    }
   }
 
   /**
@@ -24,47 +45,59 @@ class Auth {
    */
   async initPassportJs() {
     // Check if we should load the local strategy (username + password login)
-    if (global.ServerSettings.authActiveAuthMethods.includes("local")) {
+    if (global.ServerSettings.authActiveAuthMethods.includes('local')) {
       this.initAuthStrategyPassword()
     }
 
     // Check if we should load the openid strategy
-    if (global.ServerSettings.authActiveAuthMethods.includes("openid")) {
+    if (global.ServerSettings.authActiveAuthMethods.includes('openid')) {
       this.initAuthStrategyOpenID()
     }
 
-    // Load the JwtStrategy (always) -> for bearer token auth 
-    passport.use(new JwtStrategy({
-      jwtFromRequest: ExtractJwt.fromExtractors([ExtractJwt.fromAuthHeaderAsBearerToken(), ExtractJwt.fromUrlQueryParameter('token')]),
-      secretOrKey: Database.serverSettings.tokenSecret
-    }, this.jwtAuthCheck.bind(this)))
+    // Load the JwtStrategy (always) -> for bearer token auth
+    passport.use(
+      new JwtStrategy(
+        {
+          jwtFromRequest: ExtractJwt.fromExtractors([ExtractJwt.fromAuthHeaderAsBearerToken(), ExtractJwt.fromUrlQueryParameter('token')]),
+          secretOrKey: Database.serverSettings.tokenSecret
+        },
+        this.jwtAuthCheck.bind(this)
+      )
+    )
 
     // define how to seralize a user (to be put into the session)
     passport.serializeUser(function (user, cb) {
       process.nextTick(function () {
         // only store id to session
-        return cb(null, JSON.stringify({
-          id: user.id,
-        }))
+        return cb(
+          null,
+          JSON.stringify({
+            id: user.id
+          })
+        )
       })
     })
 
     // define how to deseralize a user (use the ID to get it from the database)
-    passport.deserializeUser((function (user, cb) {
-      process.nextTick((async function () {
-        const parsedUserInfo = JSON.parse(user)
-        // load the user by ID that is stored in the session
-        const dbUser = await Database.userModel.getUserById(parsedUserInfo.id)
-        return cb(null, dbUser)
-      }).bind(this))
-    }).bind(this))
+    passport.deserializeUser(
+      function (user, cb) {
+        process.nextTick(
+          async function () {
+            const parsedUserInfo = JSON.parse(user)
+            // load the user by ID that is stored in the session
+            const dbUser = await Database.userModel.getUserById(parsedUserInfo.id)
+            return cb(null, dbUser)
+          }.bind(this)
+        )
+      }.bind(this)
+    )
   }
 
   /**
    * Passport use LocalStrategy
    */
   initAuthStrategyPassword() {
-    passport.use(new LocalStrategy(this.localAuthCheckUserPw.bind(this)))
+    passport.use(new LocalStrategy({ passReqToCallback: true }, this.localAuthCheckUserPw.bind(this)))
   }
 
   /**
@@ -89,86 +122,223 @@ class Auth {
     }).Client
     const openIdClient = new openIdIssuerClient({
       client_id: global.ServerSettings.authOpenIDClientID,
-      client_secret: global.ServerSettings.authOpenIDClientSecret
+      client_secret: global.ServerSettings.authOpenIDClientSecret,
+      id_token_signed_response_alg: global.ServerSettings.authOpenIDTokenSigningAlgorithm
     })
-    passport.use('openid-client', new OpenIDClient.Strategy({
-      client: openIdClient,
-      params: {
-        redirect_uri: '/auth/openid/callback',
-        scope: 'openid profile email'
-      }
-    }, async (tokenset, userinfo, done) => {
-      Logger.debug(`[Auth] openid callback userinfo=`, userinfo)
+    passport.use(
+      'openid-client',
+      new OpenIDClient.Strategy(
+        {
+          client: openIdClient,
+          params: {
+            redirect_uri: `${global.ServerSettings.authOpenIDSubfolderForRedirectURLs}/auth/openid/callback`,
+            scope: 'openid profile email'
+          }
+        },
+        async (tokenset, userinfo, done) => {
+          try {
+            Logger.debug(`[Auth] openid callback userinfo=`, JSON.stringify(userinfo, null, 2))
 
-      let failureMessage = 'Unauthorized'
-      if (!userinfo.sub) {
-        Logger.error(`[Auth] openid callback invalid userinfo, no sub`)
-        return done(null, null, failureMessage)
-      }
+            if (!userinfo.sub) {
+              throw new Error('Invalid userinfo, no sub')
+            }
 
-      // First check for matching user by sub
-      let user = await Database.userModel.getUserByOpenIDSub(userinfo.sub)
-      if (!user) {
-        // Optionally match existing by email or username based on server setting "authOpenIDMatchExistingBy"
-        if (Database.serverSettings.authOpenIDMatchExistingBy === 'email' && userinfo.email && userinfo.email_verified) {
+            if (!this.validateGroupClaim(userinfo)) {
+              throw new Error(`Group claim ${Database.serverSettings.authOpenIDGroupClaim} not found or empty in userinfo`)
+            }
+
+            let user = await this.findOrCreateUser(userinfo)
+
+            if (!user?.isActive) {
+              throw new Error('User not active or not found')
+            }
+
+            await this.setUserGroup(user, userinfo)
+            await this.updateUserPermissions(user, userinfo)
+
+            // We also have to save the id_token for later (used for logout) because we cannot set cookies here
+            user.openid_id_token = tokenset.id_token
+
+            return done(null, user)
+          } catch (error) {
+            Logger.error(`[Auth] openid callback error: ${error?.message}\n${error?.stack}`)
+
+            return done(null, null, 'Unauthorized')
+          }
+        }
+      )
+    )
+  }
+
+  /**
+   * Finds an existing user by OpenID subject identifier, or by email/username based on server settings,
+   * or creates a new user if configured to do so.
+   *
+   * @returns {Promise<import('./models/User')|null>}
+   */
+  async findOrCreateUser(userinfo) {
+    let user = await Database.userModel.getUserByOpenIDSub(userinfo.sub)
+
+    // Matched by sub
+    if (user) {
+      Logger.debug(`[Auth] openid: User found by sub`)
+      return user
+    }
+
+    // Match existing user by email
+    if (Database.serverSettings.authOpenIDMatchExistingBy === 'email') {
+      if (userinfo.email) {
+        // Only disallow when email_verified explicitly set to false (allow both if not set or true)
+        if (userinfo.email_verified === false) {
+          Logger.warn(`[Auth] openid: User not found and email "${userinfo.email}" is not verified`)
+          return null
+        } else {
           Logger.info(`[Auth] openid: User not found, checking existing with email "${userinfo.email}"`)
           user = await Database.userModel.getUserByEmail(userinfo.email)
-          // Check that user is not already matched
+
           if (user?.authOpenIDSub) {
             Logger.warn(`[Auth] openid: User found with email "${userinfo.email}" but is already matched with sub "${user.authOpenIDSub}"`)
-            // TODO: Message isn't actually returned to the user yet. Need to override the passport authenticated callback
-            failureMessage = 'A matching user was found but is already matched with another user from your auth provider'
-            user = null
-          }
-        } else if (Database.serverSettings.authOpenIDMatchExistingBy === 'username' && userinfo.preferred_username) {
-          Logger.info(`[Auth] openid: User not found, checking existing with username "${userinfo.preferred_username}"`)
-          user = await Database.userModel.getUserByUsername(userinfo.preferred_username)
-          // Check that user is not already matched
-          if (user?.authOpenIDSub) {
-            Logger.warn(`[Auth] openid: User found with username "${userinfo.preferred_username}" but is already matched with sub "${user.authOpenIDSub}"`)
-            // TODO: Message isn't actually returned to the user yet. Need to override the passport authenticated callback
-            failureMessage = 'A matching user was found but is already matched with another user from your auth provider'
-            user = null
+            return null // User is linked to a different OpenID subject; do not proceed.
           }
         }
+      } else {
+        Logger.warn(`[Auth] openid: User not found and no email in userinfo`)
+        // We deny login, because if the admin whishes to match email, it makes sense to require it
+        return null
+      }
+    }
+    // Match existing user by username
+    else if (Database.serverSettings.authOpenIDMatchExistingBy === 'username') {
+      let username
 
-        // If existing user was matched and isActive then save sub to user
-        if (user?.isActive) {
-          Logger.info(`[Auth] openid: New user found matching existing user "${user.username}"`)
-          user.authOpenIDSub = userinfo.sub
-          await Database.userModel.updateFromOld(user)
-        } else if (user && !user.isActive) {
-          Logger.warn(`[Auth] openid: New user found matching existing user "${user.username}" but that user is deactivated`)
-        }
+      if (userinfo.preferred_username) {
+        Logger.info(`[Auth] openid: User not found, checking existing with userinfo.preferred_username "${userinfo.preferred_username}"`)
+        username = userinfo.preferred_username
+      } else if (userinfo.username) {
+        Logger.info(`[Auth] openid: User not found, checking existing with userinfo.username "${userinfo.username}"`)
+        username = userinfo.username
+      } else {
+        Logger.warn(`[Auth] openid: User not found and neither preferred_username nor username in userinfo`)
+        return null
+      }
 
-        // Optionally auto register the user 
-        if (!user && Database.serverSettings.authOpenIDAutoRegister) {
-          Logger.info(`[Auth] openid: Auto-registering user with sub "${userinfo.sub}"`, userinfo)
-          user = await Database.userModel.createUserFromOpenIdUserInfo(userinfo, this)
+      user = await Database.userModel.getUserByUsername(username)
+
+      if (user?.authOpenIDSub) {
+        Logger.warn(`[Auth] openid: User found with username "${username}" but is already matched with sub "${user.authOpenIDSub}"`)
+        return null // User is linked to a different OpenID subject; do not proceed.
+      }
+    }
+
+    // Found existing user via email or username
+    if (user) {
+      if (!user.isActive) {
+        Logger.warn(`[Auth] openid: User found but is not active`)
+        return null
+      }
+
+      // Update user with OpenID sub
+      if (!user.extraData) user.extraData = {}
+      user.extraData.authOpenIDSub = userinfo.sub
+      user.changed('extraData', true)
+      await user.save()
+
+      Logger.debug(`[Auth] openid: User found by email/username`)
+      return user
+    }
+
+    // If no existing user was matched, auto-register if configured
+    if (Database.serverSettings.authOpenIDAutoRegister) {
+      Logger.info(`[Auth] openid: Auto-registering user with sub "${userinfo.sub}"`, userinfo)
+      user = await Database.userModel.createUserFromOpenIdUserInfo(userinfo, this)
+      return user
+    }
+
+    Logger.warn(`[Auth] openid: User not found and auto-register is disabled`)
+    return null
+  }
+
+  /**
+   * Validates the presence and content of the group claim in userinfo.
+   */
+  validateGroupClaim(userinfo) {
+    const groupClaimName = Database.serverSettings.authOpenIDGroupClaim
+    if (!groupClaimName)
+      // Allow no group claim when configured like this
+      return true
+
+    // If configured it must exist in userinfo
+    if (!userinfo[groupClaimName]) {
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Sets the user group based on group claim in userinfo.
+   *
+   * @param {import('./models/User')} user
+   * @param {Object} userinfo
+   */
+  async setUserGroup(user, userinfo) {
+    const groupClaimName = Database.serverSettings.authOpenIDGroupClaim
+    if (!groupClaimName)
+      // No group claim configured, don't set anything
+      return
+
+    if (!userinfo[groupClaimName]) throw new Error(`Group claim ${groupClaimName} not found in userinfo`)
+
+    const groupsList = userinfo[groupClaimName].map((group) => group.toLowerCase())
+    const rolesInOrderOfPriority = ['admin', 'user', 'guest']
+
+    let userType = rolesInOrderOfPriority.find((role) => groupsList.includes(role))
+    if (userType) {
+      if (user.type === 'root') {
+        // Check OpenID Group
+        if (userType !== 'admin') {
+          throw new Error(`Root user "${user.username}" cannot be downgraded to ${userType}. Denying login.`)
+        } else {
+          // If root user is logging in via OpenID, we will not change the type
+          return
         }
       }
 
-      if (!user?.isActive) {
-        if (user && !user.isActive) {
-          failureMessage = 'Unauthorized'
-        }
-        // deny login
-        done(null, null, failureMessage)
-        return
+      if (user.type !== userType) {
+        Logger.info(`[Auth] openid callback: Updating user "${user.username}" type to "${userType}" from "${user.type}"`)
+        user.type = userType
+        await user.save()
       }
+    } else {
+      throw new Error(`No valid group found in userinfo: ${JSON.stringify(userinfo[groupClaimName], null, 2)}`)
+    }
+  }
 
-      // We also have to save the id_token for later (used for logout) because we cannot set cookies here
-      user.openid_id_token = tokenset.id_token
+  /**
+   * Updates user permissions based on the advanced permissions claim.
+   *
+   * @param {import('./models/User')} user
+   * @param {Object} userinfo
+   */
+  async updateUserPermissions(user, userinfo) {
+    const absPermissionsClaim = Database.serverSettings.authOpenIDAdvancedPermsClaim
+    if (!absPermissionsClaim)
+      // No advanced permissions claim configured, don't set anything
+      return
 
-      // permit login
-      return done(null, user)
-    }))
+    if (user.type === 'admin' || user.type === 'root') return
+
+    const absPermissions = userinfo[absPermissionsClaim]
+    if (!absPermissions) throw new Error(`Advanced permissions claim ${absPermissionsClaim} not found in userinfo`)
+
+    if (await user.updatePermissionsFromExternalJSON(absPermissions)) {
+      Logger.info(`[Auth] openid callback: Updating advanced perms for user "${user.username}" using "${JSON.stringify(absPermissions)}"`)
+    }
   }
 
   /**
    * Unuse strategy
-   * 
-   * @param {string} name 
+   *
+   * @param {string} name
    */
   unuseAuthStrategy(name) {
     passport.unuse(name)
@@ -176,8 +346,8 @@ class Auth {
 
   /**
    * Use strategy
-   * 
-   * @param {string} name 
+   *
+   * @param {string} name
    */
   useAuthStrategy(name) {
     if (name === 'openid') {
@@ -207,9 +377,9 @@ class Auth {
    * - 'api': Authentication for API use
    * - 'openid': OpenID authentication directly over web
    * - 'openid-mobile': OpenID authentication, but done via an mobile device
-   * 
-   * @param {import('express').Request} req
-   * @param {import('express').Response} res
+   *
+   * @param {Request} req
+   * @param {Response} res
    * @param {string} authMethod - The authentication method, default is 'local'.
    */
   paramsToCookies(req, res, authMethod = 'local') {
@@ -237,9 +407,9 @@ class Auth {
   /**
    * Informs the client in the right mode about a successfull login and the token
    * (clients choise is restored from cookies).
-   * 
-   * @param {import('express').Request} req
-   * @param {import('express').Response} res
+   *
+   * @param {Request} req
+   * @param {Response} res
    */
   async handleLoginSuccessBasedOnCookie(req, res) {
     // get userLogin json (information about the user, server and the session)
@@ -263,8 +433,8 @@ class Auth {
 
   /**
    * Creates all (express) routes required for authentication.
-   * 
-   * @param {import('express').Router} router 
+   *
+   * @param {import('express').Router} router
    */
   async initAuthRoutes(router) {
     // Local strategy login route (takes username and password)
@@ -294,7 +464,7 @@ class Auth {
         }
 
         // Generate a state on web flow or if no state supplied
-        const state = (!isMobileFlow || !req.query.state) ? OpenIDClient.generators.random() : req.query.state
+        const state = !isMobileFlow || !req.query.state ? OpenIDClient.generators.random() : req.query.state
 
         // Redirect URL for the SSO provider
         let redirectUri
@@ -310,9 +480,9 @@ class Auth {
           //   for the request to mobile-redirect and as such the session is not shared
           this.openIdAuthSession.set(state, { mobile_redirect_uri: req.query.redirect_uri })
 
-          redirectUri = new URL('/auth/openid/mobile-redirect', hostUrl).toString()
+          redirectUri = new URL(`${global.ServerSettings.authOpenIDSubfolderForRedirectURLs}/auth/openid/mobile-redirect`, hostUrl).toString()
         } else {
-          redirectUri = new URL('/auth/openid/callback', hostUrl).toString()
+          redirectUri = new URL(`${global.ServerSettings.authOpenIDSubfolderForRedirectURLs}/auth/openid/callback`, hostUrl).toString()
 
           if (req.query.state) {
             Logger.debug(`[Auth] Invalid state - not allowed on web openid flow`)
@@ -334,10 +504,19 @@ class Auth {
           sso_redirect_uri: oidcStrategy._params.redirect_uri // Save the redirect_uri (for the SSO Provider) for the callback
         }
 
+        var scope = 'openid profile email'
+        if (global.ServerSettings.authOpenIDGroupClaim) {
+          scope += ' ' + global.ServerSettings.authOpenIDGroupClaim
+        }
+        if (global.ServerSettings.authOpenIDAdvancedPermsClaim) {
+          scope += ' ' + global.ServerSettings.authOpenIDAdvancedPermsClaim
+        }
+
         const authorizationUrl = client.authorizationUrl({
           ...oidcStrategy._params,
           state: state,
           response_type: 'code',
+          scope: scope,
           code_challenge,
           code_challenge_method
         })
@@ -346,7 +525,7 @@ class Auth {
 
         res.redirect(authorizationUrl)
       } catch (error) {
-        Logger.error(`[Auth] Error in /auth/openid route: ${error}`)
+        Logger.error(`[Auth] Error in /auth/openid route: ${error}\n${error?.stack}`)
         res.status(500).send('Internal Server Error')
       }
 
@@ -371,8 +550,7 @@ class Auth {
 
       function isValidRedirectUri(uri) {
         // Check if the redirect_uri is in the whitelist
-        return Database.serverSettings.authOpenIDMobileRedirectURIs.includes(uri) ||
-          (Database.serverSettings.authOpenIDMobileRedirectURIs.length === 1 && Database.serverSettings.authOpenIDMobileRedirectURIs[0] === '*')
+        return Database.serverSettings.authOpenIDMobileRedirectURIs.includes(uri) || (Database.serverSettings.authOpenIDMobileRedirectURIs.length === 1 && Database.serverSettings.authOpenIDMobileRedirectURIs[0] === '*')
       }
     })
 
@@ -402,83 +580,85 @@ class Auth {
         // Redirect to the overwrite URI saved in the map
         res.redirect(redirectUri)
       } catch (error) {
-        Logger.error(`[Auth] Error in /auth/openid/mobile-redirect route: ${error}`)
+        Logger.error(`[Auth] Error in /auth/openid/mobile-redirect route: ${error}\n${error?.stack}`)
         res.status(500).send('Internal Server Error')
       }
     })
 
     // openid strategy callback route (this receives the token from the configured openid login provider)
-    router.get('/auth/openid/callback', (req, res, next) => {
-      const oidcStrategy = passport._strategy('openid-client')
-      const sessionKey = oidcStrategy._key
+    router.get(
+      '/auth/openid/callback',
+      (req, res, next) => {
+        const oidcStrategy = passport._strategy('openid-client')
+        const sessionKey = oidcStrategy._key
 
-      if (!req.session[sessionKey]) {
-        return res.status(400).send('No session')
-      }
-
-      // If the client sends us a code_verifier, we will tell passport to use this to send this in the token request
-      // The code_verifier will be validated by the oauth2 provider by comparing it to the code_challenge in the first request
-      // Crucial for API/Mobile clients
-      if (req.query.code_verifier) {
-        req.session[sessionKey].code_verifier = req.query.code_verifier
-      }
-
-      function handleAuthError(isMobile, errorCode, errorMessage, logMessage, response) {
-        Logger.error(logMessage)
-        if (response) {
-          // Depending on the error, it can also have a body
-          // We also log the request header the passport plugin sents for the URL
-          const header = response.req?._header.replace(/Authorization: [^\r\n]*/i, 'Authorization: REDACTED')
-          Logger.debug(header + '\n' + response.body?.toString() + '\n' + JSON.stringify(response.body, null, 2))
+        if (!req.session[sessionKey]) {
+          return res.status(400).send('No session')
         }
 
-        if (isMobile) {
-          return res.status(errorCode).send(errorMessage)
-        } else {
-          return res.redirect(`/login?error=${encodeURIComponent(errorMessage)}&autoLaunch=0`)
+        // If the client sends us a code_verifier, we will tell passport to use this to send this in the token request
+        // The code_verifier will be validated by the oauth2 provider by comparing it to the code_challenge in the first request
+        // Crucial for API/Mobile clients
+        if (req.query.code_verifier) {
+          req.session[sessionKey].code_verifier = req.query.code_verifier
         }
-      }
 
-      function passportCallback(req, res, next) {
-        return (err, user, info) => {
-          const isMobile = req.session[sessionKey]?.mobile === true
-          if (err) {
-            return handleAuthError(isMobile, 500, 'Error in callback', `[Auth] Error in openid callback - ${err}`, err?.response)
+        function handleAuthError(isMobile, errorCode, errorMessage, logMessage, response) {
+          Logger.error(JSON.stringify(logMessage, null, 2))
+          if (response) {
+            // Depending on the error, it can also have a body
+            // We also log the request header the passport plugin sents for the URL
+            const header = response.req?._header.replace(/Authorization: [^\r\n]*/i, 'Authorization: REDACTED')
+            Logger.debug(header + '\n' + JSON.stringify(response.body, null, 2))
           }
 
-          if (!user) {
-            // Info usually contains the error message from the SSO provider
-            return handleAuthError(isMobile, 401, 'Unauthorized', `[Auth] No data in openid callback - ${info}`, info?.response)
+          if (isMobile) {
+            return res.status(errorCode).send(errorMessage)
+          } else {
+            return res.redirect(`/login?error=${encodeURIComponent(errorMessage)}&autoLaunch=0`)
           }
+        }
 
-          req.logIn(user, (loginError) => {
-            if (loginError) {
-              return handleAuthError(isMobile, 500, 'Error during login', `[Auth] Error in openid callback: ${loginError}`)
+        function passportCallback(req, res, next) {
+          return (err, user, info) => {
+            const isMobile = req.session[sessionKey]?.mobile === true
+            if (err) {
+              return handleAuthError(isMobile, 500, 'Error in callback', `[Auth] Error in openid callback - ${err}`, err?.response)
             }
 
-            // The id_token does not provide access to the user, but is used to identify the user to the SSO provider
-            //   instead it containts a JWT with userinfo like user email, username, etc.
-            //   the client will get to know it anyway in the logout url according to the oauth2 spec
-            //   so it is safe to send it to the client, but we use strict settings
-            res.cookie('openid_id_token', user.openid_id_token, { maxAge: 1000 * 60 * 60 * 24 * 365 * 10, httpOnly: true, secure: true, sameSite: 'Strict' })
-            next()
-          })
+            if (!user) {
+              // Info usually contains the error message from the SSO provider
+              return handleAuthError(isMobile, 401, 'Unauthorized', `[Auth] No data in openid callback - ${info}`, info?.response)
+            }
+
+            req.logIn(user, (loginError) => {
+              if (loginError) {
+                return handleAuthError(isMobile, 500, 'Error during login', `[Auth] Error in openid callback: ${loginError}`)
+              }
+
+              // The id_token does not provide access to the user, but is used to identify the user to the SSO provider
+              //   instead it containts a JWT with userinfo like user email, username, etc.
+              //   the client will get to know it anyway in the logout url according to the oauth2 spec
+              //   so it is safe to send it to the client, but we use strict settings
+              res.cookie('openid_id_token', user.openid_id_token, { maxAge: 1000 * 60 * 60 * 24 * 365 * 10, httpOnly: true, secure: true, sameSite: 'Strict' })
+              next()
+            })
+          }
         }
-      }
 
-
-      // While not required by the standard, the passport plugin re-sends the original redirect_uri in the token request
-      // We need to set it correctly, as some SSO providers (e.g. keycloak) check that parameter when it is provided
-      // We set it here again because the passport param can change between requests
-      return passport.authenticate('openid-client', { redirect_uri: req.session[sessionKey].sso_redirect_uri }, passportCallback(req, res, next))(req, res, next)
-    },
+        // While not required by the standard, the passport plugin re-sends the original redirect_uri in the token request
+        // We need to set it correctly, as some SSO providers (e.g. keycloak) check that parameter when it is provided
+        // We set it here again because the passport param can change between requests
+        return passport.authenticate('openid-client', { redirect_uri: req.session[sessionKey].sso_redirect_uri }, passportCallback(req, res, next))(req, res, next)
+      },
       // on a successfull login: read the cookies and react like the client requested (callback or json)
-      this.handleLoginSuccessBasedOnCookie.bind(this))
+      this.handleLoginSuccessBasedOnCookie.bind(this)
+    )
 
     /**
      * Helper route used to auto-populate the openid URLs in config/authentication
      * Takes an issuer URL as a query param and requests the config data at "/.well-known/openid-configuration"
-     * 
+     *
      * @example /auth/openid/config?issuer=http://192.168.1.66:9000/application/o/audiobookshelf/
      */
     router.get('/auth/openid/config', this.isAuthenticated, async (req, res) => {
@@ -488,7 +668,7 @@ class Auth {
       }
 
       if (!req.query.issuer) {
-        return res.status(400).send('Invalid request. Query param \'issuer\' is required')
+        return res.status(400).send("Invalid request. Query param 'issuer' is required")
       }
 
       // Strip trailing slash
@@ -504,22 +684,26 @@ class Auth {
         }
       } catch (error) {
         Logger.error(`[Auth] Failed to get openid configuration. Invalid URL "${configUrl}"`, error)
-        return res.status(400).send('Invalid request. Query param \'issuer\' is invalid')
+        return res.status(400).send("Invalid request. Query param 'issuer' is invalid")
       }
 
-      axios.get(configUrl.toString()).then(({ data }) => {
-        res.json({
-          issuer: data.issuer,
-          authorization_endpoint: data.authorization_endpoint,
-          token_endpoint: data.token_endpoint,
-          userinfo_endpoint: data.userinfo_endpoint,
-          end_session_endpoint: data.end_session_endpoint,
-          jwks_uri: data.jwks_uri
+      axios
+        .get(configUrl.toString())
+        .then(({ data }) => {
+          res.json({
+            issuer: data.issuer,
+            authorization_endpoint: data.authorization_endpoint,
+            token_endpoint: data.token_endpoint,
+            userinfo_endpoint: data.userinfo_endpoint,
+            end_session_endpoint: data.end_session_endpoint,
+            jwks_uri: data.jwks_uri,
+            id_token_signing_alg_values_supported: data.id_token_signing_alg_values_supported
+          })
         })
-      }).catch((error) => {
-        Logger.error(`[Auth] Failed to get openid configuration at "${configUrl}"`, error)
-        res.status(error.statusCode || 400).send(`${error.code || 'UNKNOWN'}: Failed to get openid configuration`)
-      })
+        .catch((error) => {
+          Logger.error(`[Auth] Failed to get openid configuration at "${configUrl}"`, error)
+          res.status(error.statusCode || 400).send(`${error.code || 'UNKNOWN'}: Failed to get openid configuration`)
+        })
     })
 
     // Logout route
@@ -545,11 +729,11 @@ class Auth {
               let postLogoutRedirectUri = null
 
               if (authMethod === 'openid') {
-                const protocol = (req.secure || req.get('x-forwarded-proto') === 'https') ? 'https' : 'http'
+                const protocol = req.secure || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http'
                 const host = req.get('host')
                 // TODO: ABS does currently not support subfolders for installation
                 // If we want to support it we need to include a config for the serverurl
-                postLogoutRedirectUri = `${protocol}://${host}/login`
+                postLogoutRedirectUri = `${protocol}://${host}${global.RouterBasePath}/login`
               }
               // else for openid-mobile we keep postLogoutRedirectUri on null
               //  nice would be to redirect to the app here, but for example Authentik does not implement
@@ -579,9 +763,9 @@ class Auth {
 
   /**
    * middleware to use in express to only allow authenticated users.
-   * @param {import('express').Request} req 
-   * @param {import('express').Response} res 
-   * @param {import('express').NextFunction} next  
+   * @param {Request} req
+   * @param {Response} res
+   * @param {NextFunction} next
    */
   isAuthenticated(req, res, next) {
     // check if session cookie says that we are authenticated
@@ -589,14 +773,14 @@ class Auth {
       next()
     } else {
       // try JWT to authenticate
-      passport.authenticate("jwt")(req, res, next)
+      passport.authenticate('jwt')(req, res, next)
     }
   }
 
   /**
    * Function to generate a jwt token for a given user
-   * 
-   * @param {{ id:string, username:string }} user 
+   *
+   * @param {{ id:string, username:string }} user
    * @returns {string} token
    */
   generateAccessToken(user) {
@@ -605,15 +789,14 @@ class Auth {
 
   /**
    * Function to validate a jwt token for a given user
-   * 
-   * @param {string} token 
+   *
+   * @param {string} token
    * @returns {Object} tokens data
    */
   static validateAccessToken(token) {
     try {
       return jwt.verify(token, global.ServerSettings.tokenSecret)
-    }
-    catch (err) {
+    } catch (err) {
       return null
     }
   }
@@ -622,7 +805,8 @@ class Auth {
    * Generate a token which is used to encrpt/protect the jwts.
    */
   async initTokenSecret() {
-    if (process.env.TOKEN_SECRET) { // User can supply their own token secret
+    if (process.env.TOKEN_SECRET) {
+      // User can supply their own token secret
       Database.serverSettings.tokenSecret = process.env.TOKEN_SECRET
     } else {
       Database.serverSettings.tokenSecret = require('crypto').randomBytes(256).toString('base64')
@@ -630,19 +814,21 @@ class Auth {
     await Database.updateServerSettings()
 
     // New token secret creation added in v2.1.0 so generate new API tokens for each user
-    const users = await Database.userModel.getOldUsers()
+    const users = await Database.userModel.findAll({
+      attributes: ['id', 'username', 'token']
+    })
     if (users.length) {
       for (const user of users) {
         user.token = await this.generateAccessToken(user)
+        await user.save({ hooks: false })
       }
-      await Database.updateBulkUsers(users)
     }
   }
 
   /**
    * Checks if the user in the validated jwt_payload really exists and is active.
-   * @param {Object} jwt_payload 
-   * @param {function} done 
+   * @param {Object} jwt_payload
+   * @param {function} done
    */
   async jwtAuthCheck(jwt_payload, done) {
     // load user by id from the jwt token
@@ -660,15 +846,21 @@ class Auth {
 
   /**
    * Checks if a username and password tuple is valid and the user active.
-   * @param {string} username 
-   * @param {string} password 
-   * @param {Promise<function>} done 
+   * @param {Request} req
+   * @param {string} username
+   * @param {string} password
+   * @param {Promise<function>} done
    */
-  async localAuthCheckUserPw(username, password, done) {
+  async localAuthCheckUserPw(req, username, password, done) {
     // Load the user given it's username
     const user = await Database.userModel.getUserByUsername(username.toLowerCase())
 
     if (!user?.isActive) {
+      if (user) {
+        this.logFailedLocalAuthLoginAttempt(req, user.username, 'User is not active')
+      } else {
+        this.logFailedLocalAuthLoginAttempt(req, username, 'User not found')
+      }
       done(null, null)
       return
     }
@@ -677,14 +869,16 @@ class Auth {
     if (user.type === 'root' && !user.pash) {
       if (password) {
         // deny login
+        this.logFailedLocalAuthLoginAttempt(req, user.username, 'Root user has no password set')
         done(null, null)
         return
       }
       // approve login
+      Logger.info(`[Auth] User "${user.username}" logged in from ip ${requestIp.getClientIp(req)}`)
       done(null, user)
       return
     } else if (!user.pash) {
-      Logger.error(`[Auth] User "${user.username}"/"${user.type}" attempted to login without a password set`)
+      this.logFailedLocalAuthLoginAttempt(req, user.username, 'User has no password set. Might have been created with OpenID')
       done(null, null)
       return
     }
@@ -693,18 +887,31 @@ class Auth {
     const compare = await bcrypt.compare(password, user.pash)
     if (compare) {
       // approve login
+      Logger.info(`[Auth] User "${user.username}" logged in from ip ${requestIp.getClientIp(req)}`)
       done(null, user)
       return
     }
     // deny login
+    this.logFailedLocalAuthLoginAttempt(req, user.username, 'Invalid password')
     done(null, null)
     return
   }
 
   /**
+   *
+   * @param {Request} req
+   * @param {string} username
+   * @param {string} message
+   */
+  logFailedLocalAuthLoginAttempt(req, username, message) {
+    if (!req || !username || !message) return
+    Logger.error(`[Auth] Failed login attempt for username "${username}" from ip ${requestIp.getClientIp(req)} (${message})`)
+  }
+
+  /**
    * Hashes a password with bcrypt.
-   * @param {string} password 
-   * @returns {Promise<string>} hash 
+   * @param {string} password
+   * @returns {Promise<string>} hash
    */
   hashPass(password) {
     return new Promise((resolve) => {
@@ -720,14 +927,14 @@ class Auth {
 
   /**
    * Return the login info payload for a user
-   * 
-   * @param {Object} user 
+   *
+   * @param {import('./models/User')} user
    * @returns {Promise<Object>} jsonPayload
    */
   async getUserLoginResponsePayload(user) {
     const libraryIds = await Database.libraryModel.getAllLibraryIds()
     return {
-      user: user.toJSONForBrowser(),
+      user: user.toOldJSONForBrowser(),
       userDefaultLibraryId: user.getDefaultLibraryId(libraryIds),
       serverSettings: Database.serverSettings.toJSONForBrowser(),
       ereaderDevices: Database.emailSettings.getEReaderDevices(user),
@@ -736,9 +943,9 @@ class Auth {
   }
 
   /**
-   * 
-   * @param {string} password 
-   * @param {import('./models/User')} user 
+   *
+   * @param {string} password
+   * @param {import('./models/User')} user
    * @returns {Promise<boolean>}
    */
   comparePassword(password, user) {
@@ -749,9 +956,10 @@ class Auth {
 
   /**
    * User changes their password from request
-   * 
-   * @param {import('express').Request} req 
-   * @param {import('express').Response} res 
+   * TODO: Update responses to use error status codes
+   *
+   * @param {import('./controllers/MeController').RequestWithUser} req
+   * @param {Response} res
    */
   async userChangePassword(req, res) {
     let { password, newPassword } = req.body
@@ -782,16 +990,14 @@ class Auth {
         })
       }
     }
-
-    matchingUser.pash = pw
-
-    const success = await Database.updateUser(matchingUser)
-    if (success) {
+    try {
+      await matchingUser.update({ pash: pw })
       Logger.info(`[Auth] User "${matchingUser.username}" changed password`)
       res.json({
         success: true
       })
-    } else {
+    } catch (error) {
+      Logger.error(`[Auth] User "${matchingUser.username}" failed to change password`, error)
       res.json({
         error: 'Unknown error'
       })

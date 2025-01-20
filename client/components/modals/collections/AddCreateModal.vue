@@ -122,7 +122,7 @@ export default {
         })
         .catch((error) => {
           console.error('Failed to get collections', error)
-          this.$toast.error('Failed to load collections')
+          this.$toast.error(this.$strings.ToastFailedToLoadData)
         })
         .finally(() => {
           this.processing = false
@@ -138,12 +138,11 @@ export default {
           .$post(`/api/collections/${collection.id}/batch/remove`, { books: this.selectedBookIds })
           .then((updatedCollection) => {
             console.log(`Books removed from collection`, updatedCollection)
-            this.$toast.success(this.$strings.ToastCollectionItemsRemoveSuccess)
             this.processing = false
           })
           .catch((error) => {
             console.error('Failed to remove books from collection', error)
-            this.$toast.error(this.$strings.ToastCollectionItemsRemoveFailed)
+            this.$toast.error(this.$strings.ToastRemoveFailed)
             this.processing = false
           })
       } else {
@@ -152,12 +151,11 @@ export default {
           .$delete(`/api/collections/${collection.id}/book/${this.selectedLibraryItemId}`)
           .then((updatedCollection) => {
             console.log(`Book removed from collection`, updatedCollection)
-            this.$toast.success(this.$strings.ToastCollectionItemsRemoveSuccess)
             this.processing = false
           })
           .catch((error) => {
             console.error('Failed to remove book from collection', error)
-            this.$toast.error(this.$strings.ToastCollectionItemsRemoveFailed)
+            this.$toast.error(this.$strings.ToastRemoveFailed)
             this.processing = false
           })
       }
@@ -167,17 +165,16 @@ export default {
       this.processing = true
 
       if (this.showBatchCollectionModal) {
-        // BATCH Remove books
+        // BATCH Add books
         this.$axios
           .$post(`/api/collections/${collection.id}/batch/add`, { books: this.selectedBookIds })
           .then((updatedCollection) => {
             console.log(`Books added to collection`, updatedCollection)
-            this.$toast.success('Books added to collection')
             this.processing = false
           })
           .catch((error) => {
             console.error('Failed to add books to collection', error)
-            this.$toast.error('Failed to add books to collection')
+            this.$toast.error(this.$strings.ToastCollectionItemsAddFailed)
             this.processing = false
           })
       } else {
@@ -187,12 +184,11 @@ export default {
           .$post(`/api/collections/${collection.id}/book`, { id: this.selectedLibraryItemId })
           .then((updatedCollection) => {
             console.log(`Book added to collection`, updatedCollection)
-            this.$toast.success('Book added to collection')
             this.processing = false
           })
           .catch((error) => {
             console.error('Failed to add book to collection', error)
-            this.$toast.error('Failed to add book to collection')
+            this.$toast.error(this.$strings.ToastCollectionItemsAddFailed)
             this.processing = false
           })
       }
@@ -214,14 +210,13 @@ export default {
         .$post('/api/collections', newCollection)
         .then((data) => {
           console.log('New Collection Created', data)
-          this.$toast.success(`Collection "${data.name}" created`)
           this.processing = false
           this.newCollectionName = ''
         })
         .catch((error) => {
           console.error('Failed to create collection', error)
           var errMsg = error.response ? error.response.data || '' : ''
-          this.$toast.error(`Failed to create collection: ${errMsg}`)
+          this.$toast.error(this.$strings.ToastCollectionCreateFailed + ': ' + errMsg)
           this.processing = false
         })
     }

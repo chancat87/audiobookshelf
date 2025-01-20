@@ -3,11 +3,20 @@ const Logger = require('./Logger')
 const Database = require('./Database')
 const Auth = require('./Auth')
 
+/**
+ * @typedef SocketClient
+ * @property {string} id socket id
+ * @property {SocketIO.Socket} socket
+ * @property {number} connected_at
+ * @property {import('./models/User')} user
+ */
+
 class SocketAuthority {
   constructor() {
     this.Server = null
-    this.io = null
+    this.socketIoServers = []
 
+    /** @type {Object.<string, SocketClient>} */
     this.clients = {}
   }
 
@@ -18,27 +27,29 @@ class SocketAuthority {
    */
   getUsersOnline() {
     const onlineUsersMap = {}
-    Object.values(this.clients).filter(c => c.user).forEach(client => {
-      if (onlineUsersMap[client.user.id]) {
-        onlineUsersMap[client.user.id].connections++
-      } else {
-        onlineUsersMap[client.user.id] = {
-          ...client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions),
-          connections: 1
+    Object.values(this.clients)
+      .filter((c) => c.user)
+      .forEach((client) => {
+        if (onlineUsersMap[client.user.id]) {
+          onlineUsersMap[client.user.id].connections++
+        } else {
+          onlineUsersMap[client.user.id] = {
+            ...client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions),
+            connections: 1
+          }
         }
-      }
-    })
+      })
     return Object.values(onlineUsersMap)
   }
 
   getClientsForUser(userId) {
-    return Object.values(this.clients).filter(c => c.user && c.user.id === userId)
+    return Object.values(this.clients).filter((c) => c.user?.id === userId)
   }
 
   /**
    * Emits event to all authorized clients
-   * @param {string} evt 
-   * @param {any} data 
+   * @param {string} evt
+   * @param {any} data
    * @param {Function} [filter] optional filter function to only send event to specific users
    */
   emitter(evt, data, filter = null) {
@@ -67,7 +78,7 @@ class SocketAuthority {
   // Emits event to all admin user clients
   adminEmitter(evt, data) {
     for (const socketId in this.clients) {
-      if (this.clients[socketId].user && this.clients[socketId].user.isAdminOrUp) {
+      if (this.clients[socketId].user?.isAdminOrUp) {
         this.clients[socketId].socket.emit(evt, data)
       }
     }
@@ -75,86 +86,107 @@ class SocketAuthority {
 
   /**
    * Closes the Socket.IO server and disconnect all clients
-   * 
-   * @param {Function} callback 
+   *
+   * @param {Function} callback
    */
-  close(callback) {
-    Logger.info('[SocketAuthority] Shutting down')
-    // This will close all open socket connections, and also close the underlying http server
-    if (this.io)
-      this.io.close(callback)
-    else
-      callback()
+  async close() {
+    Logger.info('[SocketAuthority] closing...')
+    const closePromises = this.socketIoServers.map((io) => {
+      return new Promise((resolve) => {
+        Logger.info(`[SocketAuthority] Closing Socket.IO server: ${io.path}`)
+        io.close(() => {
+          Logger.info(`[SocketAuthority] Socket.IO server closed: ${io.path}`)
+          resolve()
+        })
+      })
+    })
+    await Promise.all(closePromises)
+    Logger.info('[SocketAuthority] closed')
+    this.socketIoServers = []
   }
 
   initialize(Server) {
     this.Server = Server
 
-    this.io = new SocketIO.Server(this.Server.server, {
+    const socketIoOptions = {
       cors: {
         origin: '*',
-        methods: ["GET", "POST"]
+        methods: ['GET', 'POST']
       }
-    })
+    }
 
-    this.io.on('connection', (socket) => {
-      this.clients[socket.id] = {
-        id: socket.id,
-        socket,
-        connected_at: Date.now()
-      }
-      socket.sheepClient = this.clients[socket.id]
+    const ioServer = new SocketIO.Server(Server.server, socketIoOptions)
+    ioServer.path = '/socket.io'
+    this.socketIoServers.push(ioServer)
 
-      Logger.info('[SocketAuthority] Socket Connected', socket.id)
+    if (global.RouterBasePath) {
+      // open a separate socket.io server for the router base path, keeping the original server open for legacy clients
+      const ioBasePath = `${global.RouterBasePath}/socket.io`
+      const ioBasePathServer = new SocketIO.Server(Server.server, { ...socketIoOptions, path: ioBasePath })
+      ioBasePathServer.path = ioBasePath
+      this.socketIoServers.push(ioBasePathServer)
+    }
 
-      // Required for associating a User with a socket
-      socket.on('auth', (token) => this.authenticateSocket(socket, token))
-
-      // Scanning
-      socket.on('cancel_scan', (libraryId) => this.cancelScan(libraryId))
-
-      // Logs
-      socket.on('set_log_listener', (level) => Logger.addSocketListener(socket, level))
-      socket.on('remove_log_listener', () => Logger.removeSocketListener(socket.id))
-
-      // Sent automatically from socket.io clients
-      socket.on('disconnect', (reason) => {
-        Logger.removeSocketListener(socket.id)
-
-        const _client = this.clients[socket.id]
-        if (!_client) {
-          Logger.warn(`[SocketAuthority] Socket ${socket.id} disconnect, no client (Reason: ${reason})`)
-        } else if (!_client.user) {
-          Logger.info(`[SocketAuthority] Unauth socket ${socket.id} disconnected (Reason: ${reason})`)
-          delete this.clients[socket.id]
-        } else {
-          Logger.debug('[SocketAuthority] User Offline ' + _client.user.username)
-          this.adminEmitter('user_offline', _client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions))
-
-          const disconnectTime = Date.now() - _client.connected_at
-          Logger.info(`[SocketAuthority] Socket ${socket.id} disconnected from client "${_client.user.username}" after ${disconnectTime}ms (Reason: ${reason})`)
-          delete this.clients[socket.id]
+    this.socketIoServers.forEach((io) => {
+      io.on('connection', (socket) => {
+        this.clients[socket.id] = {
+          id: socket.id,
+          socket,
+          connected_at: Date.now()
         }
-      })
+        socket.sheepClient = this.clients[socket.id]
 
-      //
-      // Events for testing
-      //
-      socket.on('message_all_users', (payload) => {
-        // admin user can send a message to all authenticated users
-        //   displays on the web app as a toast
-        const client = this.clients[socket.id] || {}
-        if (client.user && client.user.isAdminOrUp) {
-          this.emitter('admin_message', payload.message || '')
-        } else {
-          Logger.error(`[SocketAuthority] Non-admin user sent the message_all_users event`)
-        }
-      })
-      socket.on('ping', () => {
-        const client = this.clients[socket.id] || {}
-        const user = client.user || {}
-        Logger.debug(`[SocketAuthority] Received ping from socket ${user.username || 'No User'}`)
-        socket.emit('pong')
+        Logger.info(`[SocketAuthority] Socket Connected to ${io.path}`, socket.id)
+
+        // Required for associating a User with a socket
+        socket.on('auth', (token) => this.authenticateSocket(socket, token))
+
+        // Scanning
+        socket.on('cancel_scan', (libraryId) => this.cancelScan(libraryId))
+
+        // Logs
+        socket.on('set_log_listener', (level) => Logger.addSocketListener(socket, level))
+        socket.on('remove_log_listener', () => Logger.removeSocketListener(socket.id))
+
+        // Sent automatically from socket.io clients
+        socket.on('disconnect', (reason) => {
+          Logger.removeSocketListener(socket.id)
+
+          const _client = this.clients[socket.id]
+          if (!_client) {
+            Logger.warn(`[SocketAuthority] Socket ${socket.id} disconnect, no client (Reason: ${reason})`)
+          } else if (!_client.user) {
+            Logger.info(`[SocketAuthority] Unauth socket ${socket.id} disconnected (Reason: ${reason})`)
+            delete this.clients[socket.id]
+          } else {
+            Logger.debug('[SocketAuthority] User Offline ' + _client.user.username)
+            this.adminEmitter('user_offline', _client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions))
+
+            const disconnectTime = Date.now() - _client.connected_at
+            Logger.info(`[SocketAuthority] Socket ${socket.id} disconnected from client "${_client.user.username}" after ${disconnectTime}ms (Reason: ${reason})`)
+            delete this.clients[socket.id]
+          }
+        })
+
+        //
+        // Events for testing
+        //
+        socket.on('message_all_users', (payload) => {
+          // admin user can send a message to all authenticated users
+          //   displays on the web app as a toast
+          const client = this.clients[socket.id] || {}
+          if (client.user?.isAdminOrUp) {
+            this.emitter('admin_message', payload.message || '')
+          } else {
+            Logger.error(`[SocketAuthority] Non-admin user sent the message_all_users event`)
+          }
+        })
+        socket.on('ping', () => {
+          const client = this.clients[socket.id] || {}
+          const user = client.user || {}
+          Logger.debug(`[SocketAuthority] Received ping from socket ${user.username || 'No User'}`)
+          socket.emit('pong')
+        })
       })
     })
   }
@@ -162,8 +194,8 @@ class SocketAuthority {
   /**
    * When setting up a socket connection the user needs to be associated with a socket id
    * for this the client will send a 'auth' event that includes the users API token
-   * 
-   * @param {SocketIO.Socket} socket 
+   *
+   * @param {SocketIO.Socket} socket
    * @param {string} token JWT
    */
   async authenticateSocket(socket, token) {
@@ -176,6 +208,7 @@ class SocketAuthority {
       Logger.error('Cannot validate socket - invalid token')
       return socket.emit('invalid_token')
     }
+
     // get the user via the id from the decoded jwt.
     const user = await Database.userModel.getUserByIdOrOldId(token_data.userId)
     if (!user) {
@@ -196,18 +229,13 @@ class SocketAuthority {
 
     client.user = user
 
-    if (!client.user.toJSONForBrowser) {
-      Logger.error('Invalid user...', client.user)
-      return
-    }
-
     Logger.debug(`[SocketAuthority] User Online ${client.user.username}`)
 
     this.adminEmitter('user_online', client.user.toJSONForPublic(this.Server.playbackSessionManager.sessions))
 
     // Update user lastSeen without firing sequelize bulk update hooks
     user.lastSeen = Date.now()
-    await Database.userModel.updateFromOld(user, false)
+    await user.save({ hooks: false })
 
     const initialPayload = {
       userId: client.user.id,
